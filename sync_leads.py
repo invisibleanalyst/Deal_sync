@@ -43,10 +43,7 @@ DEBUG_SUBFORMS = os.getenv("LEADS_DEBUG_SUBFORMS", "false").lower() in ("1", "tr
 ONLY_INSERT_CHANGED = os.getenv("LEADS_ONLY_INSERT_CHANGED", "true").lower() in ("1", "true", "yes", "y")
 USE_MODIFIED_TIME_VERSION = os.getenv("LEADS_USE_MODIFIED_TIME_VERSION", "true").lower() in ("1", "true", "yes", "y")
 
-# Incremental sync: only fetch leads modified in the last N hours (0 = full sync)
 INCREMENTAL_HOURS = int(os.getenv("LEADS_INCREMENTAL_HOURS", "0"))
-
-# If true, first run does full sync, subsequent runs do incremental (auto-detect)
 AUTO_INCREMENTAL = os.getenv("LEADS_AUTO_INCREMENTAL", "true").lower() in ("1", "true", "yes", "y")
 AUTO_INCREMENTAL_FALLBACK_HOURS = int(os.getenv("LEADS_AUTO_INCREMENTAL_FALLBACK_HOURS", "6"))
 
@@ -90,6 +87,35 @@ FIELD_MAPPING = {
     "Email": "email",
     "Owner": "owner",
 }
+
+# ======================================================
+# DATETIME PARSING (bulletproof)
+# ======================================================
+EPOCH_ZERO = datetime(1970, 1, 1, tzinfo=dt_timezone.utc)
+
+def parse_datetime_safe(value) -> datetime:
+    """
+    Convert any value to a datetime object for ClickHouse.
+    Never returns a string — always returns a datetime.
+    """
+    if isinstance(value, datetime):
+        return value
+    if not value or not isinstance(value, str):
+        return EPOCH_ZERO
+    value = value.strip()
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S.%f%z",
+        "%Y-%m-%d %H:%M:%S%z",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+    ):
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    return EPOCH_ZERO
+
 
 # ======================================================
 # HELPERS
@@ -245,13 +271,12 @@ def zoho_get(session: requests.Session, url: str, headers: dict, params=None, ti
 
 
 # ──────────────────────────────────────────────────────
-# BULK PAGINATED FETCH (replaces per-ID fetching)
+# BULK PAGINATED FETCH
 # ──────────────────────────────────────────────────────
 def fetch_all_leads_bulk(headers: dict, modified_since: str = None) -> list:
     """
     Fetch leads via paginated list API (200/page).
-    If modified_since is set, uses If-Modified-Since header for incremental sync.
-    50k leads ≈ 250 requests instead of 50,000.
+    50k leads = ~250 requests instead of 50,000.
     """
     logger.info("📥 Fetching leads in bulk pages%s...",
                 f" (modified since {modified_since})" if modified_since else " (full sync)")
@@ -269,7 +294,6 @@ def fetch_all_leads_bulk(headers: dict, modified_since: str = None) -> list:
         try:
             res = zoho_get(session, url, req_headers, params=params, timeout=90)
         except requests.exceptions.HTTPError as e:
-            # 304 Not Modified — nothing changed
             if e.response is not None and e.response.status_code == 304:
                 logger.info("✅ No leads modified since %s", modified_since)
                 return []
@@ -291,7 +315,7 @@ def fetch_all_leads_bulk(headers: dict, modified_since: str = None) -> list:
 
 
 # ──────────────────────────────────────────────────────
-# PER-ID DETAIL FETCH (only used when subforms missing)
+# PER-ID DETAIL FETCH (only for subforms)
 # ──────────────────────────────────────────────────────
 _thread_local = threading.local()
 
@@ -311,10 +335,7 @@ def fetch_lead_by_id(headers: dict, lead_id: str) -> dict:
 
 
 def fetch_subform_details_parallel(headers: dict, lead_map: dict):
-    """
-    Fetch individual lead details ONLY to fill in subform data.
-    Only called when bulk response doesn't include subforms.
-    """
+    """Fetch individual details ONLY to fill subform data."""
     ids = list(lead_map.keys())
     logger.info("⚠️  Subforms missing from bulk. Fetching %s details (workers=%s)...", len(ids), DETAIL_WORKERS)
 
@@ -352,7 +373,7 @@ def fetch_zoho_leads_with_subforms_fast(modified_since: str = None):
     access_token = get_zoho_access_token()
     headers = {"Authorization": f"Zoho-oauthtoken {access_token}"}
 
-    # Step 1: Bulk fetch (optionally incremental)
+    # Step 1: Bulk fetch
     leads = fetch_all_leads_bulk(headers, modified_since=modified_since)
     if not leads:
         return leads
@@ -465,10 +486,6 @@ def get_existing_hashes(client):
 
 
 def get_last_sync_time(client) -> str:
-    """
-    Get the most recent modified_time from ClickHouse for incremental sync.
-    Tries both 'modified_time' and 'Modified_Time' column names.
-    """
     for col_name in ("modified_time", "Modified_Time"):
         try:
             q = f"SELECT max(`{col_name}`) FROM {CLICKHOUSE_DB}.{CLICKHOUSE_LEADS_TABLE}"
@@ -491,30 +508,6 @@ def table_has_data(client) -> bool:
         return rows and rows[0][0] > 0
     except Exception:
         return False
-
-
-def parse_datetime_safe(value) -> datetime:
-    """
-    Convert a string/datetime to a timezone-aware datetime object.
-    Handles Zoho formats like '2026-02-19T11:43:00+03:00' and plain datetimes.
-    Returns epoch 0 as fallback so ClickHouse never gets a string.
-    """
-    if isinstance(value, datetime):
-        return value
-    if not value or not isinstance(value, str):
-        return datetime(1970, 1, 1, tzinfo=dt_timezone.utc)
-    value = value.strip()
-    for fmt in (
-        "%Y-%m-%dT%H:%M:%S%z",
-        "%Y-%m-%dT%H:%M:%S.%f%z",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S",
-    ):
-        try:
-            return datetime.strptime(value, fmt)
-        except ValueError:
-            continue
-    return datetime(1970, 1, 1, tzinfo=dt_timezone.utc)
 
 
 def _col_type(col: str) -> str:
@@ -562,10 +555,66 @@ def ensure_table_and_columns(client, records):
             )
 
 
+def build_insert_data(records, column_names):
+    """
+    Build insert data with STRICT type enforcement.
+    DateTime columns ALWAYS get datetime objects, never strings.
+    This validates BEFORE sending to ClickHouse so errors are caught early.
+    """
+    datetime_cols = {"inserted_at", "modified_time"}
+    data = []
+    type_errors = []
+
+    for idx, r in enumerate(records):
+        row = []
+        for col in column_names:
+            if col in datetime_cols:
+                raw = r.get(col)
+                if col == "modified_time" and not raw:
+                    # Fallback to inserted_at if no modified_time
+                    raw = r.get("inserted_at")
+                parsed = parse_datetime_safe(raw)
+                if not isinstance(parsed, datetime):
+                    type_errors.append(f"Row {idx}, col {col}: got {type(parsed)} = {parsed!r}")
+                    parsed = EPOCH_ZERO
+                row.append(parsed)
+            else:
+                v = r.get(col, "")
+                row.append("" if v is None else str(v))
+        data.append(row)
+
+    if type_errors:
+        logger.warning("⚠️  %s type conversion issues (using fallback):", len(type_errors))
+        for e in type_errors[:5]:
+            logger.warning("   %s", e)
+
+    return data
+
+
+def validate_insert_data(data, column_names):
+    """
+    Pre-flight check: ensure every DateTime column has actual datetime objects.
+    Raises early with a clear error instead of failing deep in clickhouse_connect.
+    """
+    datetime_cols = {i for i, c in enumerate(column_names) if c in ("inserted_at", "modified_time")}
+
+    for row_idx, row in enumerate(data[:10]):  # check first 10 rows
+        for col_idx in datetime_cols:
+            val = row[col_idx]
+            if not isinstance(val, datetime):
+                raise TypeError(
+                    f"VALIDATION FAILED: Row {row_idx}, column '{column_names[col_idx]}' "
+                    f"expected datetime but got {type(val).__name__}: {val!r}"
+                )
+
+    logger.info("✅ Pre-insert validation passed (%s rows, %s columns)", len(data), len(column_names))
+
+
 def insert_records(client, records):
     if not records:
         logger.warning("No records to insert.")
         return
+
     column_names = sorted({k for r in records for k in r.keys()})
 
     if RECREATE_TABLE:
@@ -573,21 +622,13 @@ def insert_records(client, records):
     else:
         ensure_table_and_columns(client, records)
 
-    logger.info("📤 Inserting %s records into ClickHouse...", len(records))
-    data = []
-    for r in records:
-        row = []
-        for col in column_names:
-            if col == "inserted_at":
-                row.append(r.get(col))
-            elif col == "modified_time":
-                mt = r.get(col)
-                row.append(parse_datetime_safe(mt) if mt else r.get("inserted_at"))
-            else:
-                v = r.get(col, "")
-                row.append("" if v is None else str(v))
-        data.append(row)
+    logger.info("📤 Building insert data for %s records...", len(records))
+    data = build_insert_data(records, column_names)
 
+    # Validate BEFORE inserting — fail fast with clear error
+    validate_insert_data(data, column_names)
+
+    logger.info("📤 Inserting %s records into ClickHouse...", len(records))
     for i in range(0, len(data), BATCH_SIZE):
         batch = data[i:i + BATCH_SIZE]
         client.insert(CLICKHOUSE_LEADS_TABLE, batch, column_names=column_names)
@@ -613,26 +654,21 @@ def sync_job():
     modified_since = None
 
     if INCREMENTAL_HOURS > 0:
-        # Explicit override: always use this window
         cutoff = datetime.now(dt_timezone.utc) - timedelta(hours=INCREMENTAL_HOURS)
         modified_since = cutoff.strftime("%Y-%m-%dT%H:%M:%S+00:00")
         logger.info("🔄 Incremental sync (explicit): last %s hours", INCREMENTAL_HOURS)
-
     elif AUTO_INCREMENTAL and not RECREATE_TABLE:
         if table_has_data(client):
-            # Table has data → incremental from last modified_time
             last_sync = get_last_sync_time(client)
             if last_sync:
                 modified_since = last_sync
-                logger.info("🔄 Auto-incremental sync from last modified_time: %s", modified_since)
+                logger.info("🔄 Auto-incremental from: %s", modified_since)
             else:
-                # Fallback: use N hours ago
                 cutoff = datetime.now(dt_timezone.utc) - timedelta(hours=AUTO_INCREMENTAL_FALLBACK_HOURS)
                 modified_since = cutoff.strftime("%Y-%m-%dT%H:%M:%S+00:00")
                 logger.info("🔄 Auto-incremental fallback: last %s hours", AUTO_INCREMENTAL_FALLBACK_HOURS)
         else:
-            logger.info("📦 First run detected — doing full sync")
-
+            logger.info("📦 First run — full sync")
     else:
         logger.info("📦 Full sync mode")
 
@@ -641,24 +677,33 @@ def sync_job():
 
     if leads:
         keys = list(leads[0].keys())
-        logger.info("🔎 Sample keys: %s", keys[:60])
-        logger.info("🔎 Campaigns key (%s): %s", CAMPAIGNS_SUBFORM_KEY, CAMPAIGNS_SUBFORM_KEY in leads[0])
-        logger.info("🔎 Events key (%s): %s", EVENTS_SUBFORM_KEY, EVENTS_SUBFORM_KEY in leads[0])
+        logger.info("🔎 Sample keys (%s total): %s", len(keys), keys[:30])
 
     records = prepare_records(leads)
+
+    # ── Validate data types EARLY before any DB work ──
+    if records:
+        logger.info("🔍 Validating data types before insert...")
+        sample = records[0]
+        mt = sample.get("modified_time")
+        ia = sample.get("inserted_at")
+        logger.info("  modified_time: type=%s value=%r", type(mt).__name__, mt)
+        logger.info("  inserted_at:   type=%s value=%r", type(ia).__name__, ia)
+
+        # Quick test parse
+        test_dt = parse_datetime_safe(mt)
+        logger.info("  parsed modified_time: type=%s value=%r", type(test_dt).__name__, test_dt)
+
+        if not isinstance(test_dt, datetime):
+            logger.error("❌ FATAL: modified_time did not parse to datetime! Aborting.")
+            return
 
     # ── Change detection ──
     if ONLY_INSERT_CHANGED and records:
         existing_hashes = get_existing_hashes(client)
         before = len(records)
         records = [r for r in records if existing_hashes.get(r["id"]) != r["record_hash"]]
-        logger.info("🧹 Change-detect: %s → %s rows (skipped %s unchanged)", before, len(records), before - len(records))
-
-    if records:
-        sample = records[0]
-        logger.info("🧪 Sample: campaign=%s, advert=%s, event=%s, date=%s",
-                     sample.get("campaigns_campaign_name"), sample.get("campaigns_advert_id"),
-                     sample.get("events_event_name"), sample.get("events_event_date"))
+        logger.info("🧹 Change-detect: %s → %s (skipped %s)", before, len(records), before - len(records))
 
     insert_records(client, records)
 
