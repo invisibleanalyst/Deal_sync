@@ -466,21 +466,21 @@ def get_existing_hashes(client):
 
 def get_last_sync_time(client) -> str:
     """
-    Get the most recent modified_time from ClickHouse to use as incremental cursor.
-    Returns ISO format string or empty string if table is empty/missing.
+    Get the most recent modified_time from ClickHouse for incremental sync.
+    Tries both 'modified_time' and 'Modified_Time' column names.
     """
-    try:
-        q = f"SELECT max(modified_time) FROM {CLICKHOUSE_DB}.{CLICKHOUSE_LEADS_TABLE}"
-        rows = client.query(q).result_rows
-        if rows and rows[0][0]:
-            val = rows[0][0]
-            # ClickHouse returns datetime — format for Zoho If-Modified-Since header
-            if isinstance(val, datetime):
-                # Zoho expects: yyyy-MM-ddTHH:mm:ssZ or ISO 8601
-                return val.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-            return str(val)
-    except Exception as e:
-        logger.info("Could not get last sync time (table may not exist): %s", e)
+    for col_name in ("modified_time", "Modified_Time"):
+        try:
+            q = f"SELECT max(`{col_name}`) FROM {CLICKHOUSE_DB}.{CLICKHOUSE_LEADS_TABLE}"
+            rows = client.query(q).result_rows
+            if rows and rows[0][0]:
+                val = rows[0][0]
+                if isinstance(val, datetime):
+                    return val.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+                return str(val)
+        except Exception:
+            continue
+    logger.info("Could not get last sync time (column may not exist)")
     return ""
 
 
@@ -491,6 +491,30 @@ def table_has_data(client) -> bool:
         return rows and rows[0][0] > 0
     except Exception:
         return False
+
+
+def parse_datetime_safe(value) -> datetime:
+    """
+    Convert a string/datetime to a timezone-aware datetime object.
+    Handles Zoho formats like '2026-02-19T11:43:00+03:00' and plain datetimes.
+    Returns epoch 0 as fallback so ClickHouse never gets a string.
+    """
+    if isinstance(value, datetime):
+        return value
+    if not value or not isinstance(value, str):
+        return datetime(1970, 1, 1, tzinfo=dt_timezone.utc)
+    value = value.strip()
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S.%f%z",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+    ):
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    return datetime(1970, 1, 1, tzinfo=dt_timezone.utc)
 
 
 def _col_type(col: str) -> str:
@@ -558,7 +582,7 @@ def insert_records(client, records):
                 row.append(r.get(col))
             elif col == "modified_time":
                 mt = r.get(col)
-                row.append(mt if mt else r.get("inserted_at"))
+                row.append(parse_datetime_safe(mt) if mt else r.get("inserted_at"))
             else:
                 v = r.get(col, "")
                 row.append("" if v is None else str(v))
