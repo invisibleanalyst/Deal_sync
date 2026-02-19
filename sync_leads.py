@@ -47,6 +47,12 @@ INCREMENTAL_HOURS = int(os.getenv("LEADS_INCREMENTAL_HOURS", "0"))
 AUTO_INCREMENTAL = os.getenv("LEADS_AUTO_INCREMENTAL", "true").lower() in ("1", "true", "yes", "y")
 AUTO_INCREMENTAL_FALLBACK_HOURS = int(os.getenv("LEADS_AUTO_INCREMENTAL_FALLBACK_HOURS", "6"))
 
+# Force full sync (ignore incremental, re-fetch everything, no change-detect skip)
+FORCE_FULL_SYNC = os.getenv("LEADS_FORCE_FULL_SYNC", "false").lower() in ("1", "true", "yes", "y")
+
+# Force ClickHouse OPTIMIZE after insert so ReplacingMergeTree deduplicates immediately
+FORCE_OPTIMIZE = os.getenv("LEADS_FORCE_OPTIMIZE", "true").lower() in ("1", "true", "yes", "y")
+
 # ======================================================
 # SUBFORMS
 # ======================================================
@@ -653,7 +659,9 @@ def sync_job():
     # ── Determine incremental vs full sync ──
     modified_since = None
 
-    if INCREMENTAL_HOURS > 0:
+    if FORCE_FULL_SYNC:
+        logger.info("📦 FORCE_FULL_SYNC enabled — fetching ALL leads, no change-detect skip")
+    elif INCREMENTAL_HOURS > 0:
         cutoff = datetime.now(dt_timezone.utc) - timedelta(hours=INCREMENTAL_HOURS)
         modified_since = cutoff.strftime("%Y-%m-%dT%H:%M:%S+00:00")
         logger.info("🔄 Incremental sync (explicit): last %s hours", INCREMENTAL_HOURS)
@@ -698,14 +706,23 @@ def sync_job():
             logger.error("❌ FATAL: modified_time did not parse to datetime! Aborting.")
             return
 
-    # ── Change detection ──
-    if ONLY_INSERT_CHANGED and records:
+    # ── Change detection (skip if FORCE_FULL_SYNC) ──
+    if ONLY_INSERT_CHANGED and not FORCE_FULL_SYNC and records:
         existing_hashes = get_existing_hashes(client)
         before = len(records)
         records = [r for r in records if existing_hashes.get(r["id"]) != r["record_hash"]]
         logger.info("🧹 Change-detect: %s → %s (skipped %s)", before, len(records), before - len(records))
 
     insert_records(client, records)
+
+    # Force ReplacingMergeTree to deduplicate NOW so queries return latest data
+    if FORCE_OPTIMIZE and records:
+        logger.info("🔄 Running OPTIMIZE FINAL to deduplicate rows...")
+        try:
+            client.command(f"OPTIMIZE TABLE {CLICKHOUSE_DB}.{CLICKHOUSE_LEADS_TABLE} FINAL")
+            logger.info("✅ OPTIMIZE FINAL complete — stale rows replaced.")
+        except Exception as e:
+            logger.warning("⚠️  OPTIMIZE FINAL failed (non-fatal): %s", e)
 
     elapsed = time.time() - start_time
     logger.info("🎉 Leads sync completed in %.1f seconds (%.1f minutes).", elapsed, elapsed / 60)
