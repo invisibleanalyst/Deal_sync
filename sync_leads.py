@@ -235,24 +235,60 @@ def dedupe_preserve_order(items):
 # ======================================================
 # ZOHO API
 # ======================================================
-def get_zoho_access_token():
-    url = "https://accounts.zoho.com/oauth/v2/token"
-    params = {
-        "refresh_token": REFRESH_TOKEN,
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "grant_type": "refresh_token",
-    }
-    r = requests.post(url, params=params, timeout=60)
-    r.raise_for_status()
-    return r.json()["access_token"]
+class ZohoTokenManager:
+    """Auto-refreshing token manager. Refreshes token before it expires."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._token = None
+        self._expires_at = 0  # epoch timestamp
+
+    def get_token(self) -> str:
+        with self._lock:
+            # Refresh if token is missing or expires within 60 seconds
+            if not self._token or time.time() >= (self._expires_at - 60):
+                self._refresh()
+            return self._token
+
+    def _refresh(self):
+        logger.info("🔑 Refreshing Zoho access token...")
+        url = "https://accounts.zoho.com/oauth/v2/token"
+        params = {
+            "refresh_token": REFRESH_TOKEN,
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "grant_type": "refresh_token",
+        }
+        r = requests.post(url, params=params, timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        self._token = data["access_token"]
+        # Zoho tokens typically expire in 3600s; use response or default
+        expires_in = int(data.get("expires_in", 3600))
+        self._expires_at = time.time() + expires_in
+        logger.info("✅ Token refreshed (expires in %ss)", expires_in)
+
+    def get_headers(self) -> dict:
+        return {"Authorization": f"Zoho-oauthtoken {self.get_token()}"}
+
+
+# Global token manager (thread-safe)
+zoho_tokens = ZohoTokenManager()
 
 
 def zoho_get(session: requests.Session, url: str, headers: dict, params=None, timeout=90):
     last_exc = None
     for attempt in range(1, 6):
         try:
-            r = session.get(url, headers=headers, params=params, timeout=timeout)
+            # Always use fresh token from manager
+            fresh_headers = {**headers, **zoho_tokens.get_headers()}
+            r = session.get(url, headers=fresh_headers, params=params, timeout=timeout)
+
+            if r.status_code == 401:
+                logger.warning("401 Unauthorized — forcing token refresh (attempt %s)", attempt)
+                zoho_tokens._expires_at = 0  # force refresh on next call
+                time.sleep(1)
+                continue
+
             if r.status_code == 429:
                 retry_after = r.headers.get("Retry-After")
                 wait = int(retry_after) if retry_after and retry_after.isdigit() else min(60, 2 ** attempt)
@@ -375,8 +411,7 @@ def fetch_full_details_parallel(headers: dict, lead_map: dict):
 # MAIN FETCH ORCHESTRATOR
 # ──────────────────────────────────────────────────────
 def fetch_zoho_leads_with_subforms_fast(modified_since: str = None):
-    access_token = get_zoho_access_token()
-    headers = {"Authorization": f"Zoho-oauthtoken {access_token}"}
+    headers = zoho_tokens.get_headers()
 
     # Step 1: Bulk fetch
     leads = fetch_all_leads_bulk(headers, modified_since=modified_since)
