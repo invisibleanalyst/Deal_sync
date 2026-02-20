@@ -402,7 +402,7 @@ def fetch_zoho_leads_with_subforms_fast(modified_since: str = None):
 # ======================================================
 # NORMALIZATION
 # ======================================================
-def normalize_record(record: dict) -> dict:
+def normalize_record(record: dict, debug=False) -> dict:
     flat = {
         "id": record.get("id", "") or "",
         "full_name": "", "phone": "", "email": "", "owner": "",
@@ -422,12 +422,15 @@ def normalize_record(record: dict) -> dict:
     ]:
         flat[col] = ""
 
+    processed_keys = []
     for key, value in record.items():
         if key in SUBFORM_KEYS:
             flatten_subform_into_flat(flat, key, value)
+            processed_keys.append((key, "subform"))
             continue
         if USE_MODIFIED_TIME_VERSION and key in ("Modified_Time", "Last_Modified_Time"):
             flat["modified_time"] = normalize_value(value)
+            processed_keys.append((key, "modified_time"))
             continue
         if key == "Created_By":
             if isinstance(value, list) and value and isinstance(value[0], dict):
@@ -439,28 +442,48 @@ def normalize_record(record: dict) -> dict:
                 flat["created_at"] = value.get("created_time", "") or ""
                 flat["created_by_id"] = value.get("id", "") or ""
                 flat["created_by_name"] = value.get("name", "") or ""
+            processed_keys.append((key, "created_by"))
             continue
         if key == "Full_Name":
-            flat["full_name"] = normalize_value(value); continue
+            flat["full_name"] = normalize_value(value)
+            processed_keys.append((key, f"full_name={flat['full_name']}"))
+            continue
         if key == "Phone":
-            flat["phone"] = normalize_value(value); continue
+            flat["phone"] = normalize_value(value)
+            processed_keys.append((key, f"phone={flat['phone']}"))
+            continue
         if key == "Email":
-            flat["email"] = normalize_value(value); continue
+            flat["email"] = normalize_value(value)
+            processed_keys.append((key, f"email={flat['email']}"))
+            continue
         if key == "Owner":
             flat["owner"] = (value.get("name") or value.get("id") or "") if isinstance(value, dict) else normalize_value(value)
+            processed_keys.append((key, f"owner={flat['owner']}"))
             continue
 
         out_key = FIELD_MAPPING.get(key, sanitize_column_name(key))
         if isinstance(value, dict) and "name" in value:
             flat[out_key] = value.get("name") or ""
+            processed_keys.append((key, f"{out_key}=dict.name"))
             continue
         flat[out_key] = "" if value is None else str(value)
+        processed_keys.append((key, f"{out_key}={'set' if value else 'empty'}"))
+
+    if debug:
+        logger.info("🔬 normalize_record debug — processed %s keys:", len(processed_keys))
+        for k, action in processed_keys[:30]:
+            logger.info("   %s → %s", k, action)
+        # Show non-empty flat values
+        non_empty = {k: v for k, v in flat.items() if v and v != ""}
+        logger.info("🔬 Non-empty flat fields (%s): %s", len(non_empty), list(non_empty.keys())[:30])
 
     return flat
 
 
 def prepare_records(raw_records):
-    normalized = [normalize_record(r) for r in raw_records]
+    normalized = []
+    for i, r in enumerate(raw_records):
+        normalized.append(normalize_record(r, debug=(i == 0)))
     inserted_at = datetime.now(pytz_timezone("Africa/Nairobi")).replace(microsecond=0)
     for r in normalized:
         r["inserted_at"] = inserted_at
@@ -685,6 +708,19 @@ def sync_job():
     if leads:
         keys = list(leads[0].keys())
         logger.info("🔎 Sample keys (%s total): %s", len(keys), keys[:30])
+
+        # DEBUG: Print actual values of first lead to see what Zoho returned
+        sample_lead = leads[0]
+        logger.info("🔬 DEBUG — First lead raw data (first 20 fields):")
+        for i, (k, v) in enumerate(sample_lead.items()):
+            if i >= 20:
+                break
+            logger.info("   %s = %r (type=%s)", k, v, type(v).__name__)
+
+        # Check specific important fields
+        for field in ["Full_Name", "Phone", "Email", "Owner", "Last_Note_Date", "Modified_Time"]:
+            val = sample_lead.get(field, "<<MISSING>>")
+            logger.info("   CHECK %s = %r", field, val)
 
     records = prepare_records(leads)
 
