@@ -340,10 +340,10 @@ def fetch_lead_by_id(headers: dict, lead_id: str) -> dict:
     return data[0] if data else {}
 
 
-def fetch_subform_details_parallel(headers: dict, lead_map: dict):
-    """Fetch individual details ONLY to fill subform data."""
+def fetch_full_details_parallel(headers: dict, lead_map: dict):
+    """Fetch full individual details and REPLACE bulk records entirely."""
     ids = list(lead_map.keys())
-    logger.info("⚠️  Subforms missing from bulk. Fetching %s details (workers=%s)...", len(ids), DETAIL_WORKERS)
+    logger.info("📥 Fetching %s full lead details (workers=%s)...", len(ids), DETAIL_WORKERS)
 
     errors = 0
     start = time.time()
@@ -356,9 +356,8 @@ def fetch_subform_details_parallel(headers: dict, lead_map: dict):
             try:
                 detail = fut.result()
                 if detail:
-                    for key in SUBFORM_KEYS:
-                        if key in detail:
-                            lead_map[lid][key] = detail[key]
+                    # Replace the entire record with full detail
+                    lead_map[lid] = detail
             except Exception as e:
                 errors += 1
                 if errors <= 20:
@@ -394,9 +393,9 @@ def fetch_zoho_leads_with_subforms_fast(modified_since: str = None):
         logger.info("✅ Subforms in bulk — no per-ID fetches needed!")
         return leads
 
-    # Step 3: Per-ID fetch ONLY for subforms
+    # Step 3: Bulk didn't include full data — fetch ALL details per ID
     lead_map = {l.get("id"): l for l in leads if l.get("id")}
-    fetch_subform_details_parallel(headers, lead_map)
+    fetch_full_details_parallel(headers, lead_map)
     return list(lead_map.values())
 
 
